@@ -1,6 +1,48 @@
 'use client';
 
 import { useState, KeyboardEvent, useRef, useEffect } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+
+function articleUrl(article: Article): string {
+  const doi = article.articleids?.find(id => id.idtype === 'doi')?.value;
+  return doi ? `https://doi.org/${doi}` : `https://pubmed.ncbi.nlm.nih.gov/${article.uid}/`;
+}
+
+function addPaperLinks(content: string, articles: Article[]): string {
+  // Multiple papers: [Papers 4 and 22], [Papers 1, 2, and 3], etc.
+  content = content.replace(/\[Papers ([^\]]+)\]/g, (match, inner) => {
+    const nums = inner.match(/\d+/g);
+    if (!nums) return match;
+    const links = nums.map((num: string) => {
+      const article = articles[parseInt(num) - 1];
+      if (!article) return `Paper ${num}`;
+      return `[PMID ${article.uid}](${articleUrl(article)})`;
+    });
+    return links.join(', ');
+  });
+
+  // Single paper: [Paper N] → full title as link
+  content = content.replace(/\[Paper (\d+)\]/g, (match, num) => {
+    const article = articles[parseInt(num) - 1];
+    if (!article) return match;
+    return `[${article.title}](${articleUrl(article)})`;
+  });
+
+  // Bare number citations: [3], [1,7,9], [4, 22] → PMID hyperlinks
+  content = content.replace(/\[(\d+(?:[,\s]*\d+)*)\]/g, (match, inner) => {
+    const nums = (inner.match(/\d+/g) ?? []) as string[];
+    if (!nums.length) return match;
+    const links = nums.map(num => {
+      const article = articles[parseInt(num) - 1];
+      if (!article) return num;
+      return `[PMID ${article.uid}](${articleUrl(article)})`;
+    });
+    return links.join(', ');
+  });
+
+  return content;
+}
 
 type ChatMessage = { role: 'user' | 'assistant'; content: string };
 
@@ -71,7 +113,9 @@ export default function Home() {
   const [isChatLoading, setIsChatLoading] = useState(false);
   const [chatAbstracts, setChatAbstracts] = useState<Record<string, string> | null>(null);
   const [isLoadingAbstracts, setIsLoadingAbstracts] = useState(false);
+  const [chatArticles, setChatArticles] = useState<Article[]>([]);
   const chatBottomRef = useRef<HTMLDivElement>(null);
+  const chatPanelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -90,6 +134,7 @@ export default function Home() {
     setChatOpen(false);
     setChatMessages([]);
     setChatAbstracts(null);
+    setChatArticles([]);
 
     try {
       const res = await fetch('/api/search', {
@@ -209,9 +254,17 @@ export default function Home() {
 
   const openChat = async () => {
     setChatOpen(true);
+    setTimeout(() => chatPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50);
     if (chatAbstracts) return; // already fetched
-    const articles = cachedArticles.length > 0 ? cachedArticles : results;
-    if (!articles.length) return;
+
+    // If all articles are already cached locally, use them
+    if (cachedArticles.length > 0) {
+      setChatArticles(cachedArticles);
+      setChatAbstracts({});
+      return;
+    }
+
+    // Otherwise fetch the full result set
     setIsLoadingAbstracts(true);
     try {
       const res = await fetch('/api/search', {
@@ -220,9 +273,10 @@ export default function Home() {
         body: JSON.stringify({ query: lastQuery, translatedQuery: pubmedQuery, filters: lastFilters, page: 0, returnAll: true }),
       });
       const data = await res.json();
-      // Fetch abstracts via export endpoint reuse: send to chat directly
-      setChatAbstracts({}); // trigger chat with empty abstracts — server will fetch
+      setChatArticles(data.articles?.length ? data.articles : results);
+      setChatAbstracts({});
     } catch {
+      setChatArticles(results);
       setChatAbstracts({});
     } finally {
       setIsLoadingAbstracts(false);
@@ -232,7 +286,7 @@ export default function Home() {
   const sendChatMessage = async (text?: string) => {
     const content = (text ?? chatInput).trim();
     if (!content || isChatLoading) return;
-    const articles = cachedArticles.length > 0 ? cachedArticles : results;
+    const articles = chatArticles.length > 0 ? chatArticles : (cachedArticles.length > 0 ? cachedArticles : results);
     if (!articles.length) return;
 
     const newMessages: ChatMessage[] = [...chatMessages, { role: 'user', content }];
@@ -582,6 +636,18 @@ export default function Home() {
                 >
                   {isExporting ? 'Exporting…' : `Export ${(cachedArticles.length || totalResults).toLocaleString()} to NotebookLM`}
                 </button>
+                <button
+                  onClick={openChat}
+                  className="px-3 py-1 text-sm transition-colors"
+                  style={{
+                    border: '1px solid #20558A',
+                    backgroundColor: '#20558A',
+                    color: '#fff',
+                    cursor: 'pointer',
+                  }}
+                >
+                  💬 Chat with results
+                </button>
               </div>
             </div>
           )}
@@ -637,28 +703,14 @@ export default function Home() {
             </p>
           )}
 
-          {/* Chat with Results */}
-          {!isLoading && results.length > 0 && (
-            <div className="mt-6">
-              {!chatOpen ? (
-                <button
-                  onClick={openChat}
-                  className="w-full py-3 text-sm font-medium transition-colors"
-                  style={{
-                    border: '2px solid #20558A',
-                    backgroundColor: '#fff',
-                    color: '#20558A',
-                    cursor: 'pointer',
-                  }}
-                >
-                  💬 Chat with these {(cachedArticles.length || totalResults).toLocaleString()} results
-                </button>
-              ) : (
+          {/* Chat Panel */}
+          {!isLoading && results.length > 0 && chatOpen && (
+            <div className="mt-6" ref={chatPanelRef}>
                 <div style={{ border: '1px solid #D3D3D3' }}>
                   {/* Chat header */}
                   <div className="flex items-center justify-between px-4 py-2" style={{ backgroundColor: '#20558A' }}>
                     <span className="text-sm font-medium text-white">
-                      💬 Chat with {(cachedArticles.length || totalResults).toLocaleString()} papers
+                      💬 Chat with {(chatArticles.length || cachedArticles.length || totalResults).toLocaleString()} papers
                     </span>
                     <button
                       onClick={() => setChatOpen(false)}
@@ -679,6 +731,7 @@ export default function Home() {
                           'Which papers have the strongest study design?',
                           'Are there any contradictions in the findings?',
                           'Summarize the clinical implications',
+                          'Summarize and make recommendations',
                         ].map(q => (
                           <button
                             key={q}
@@ -705,17 +758,48 @@ export default function Home() {
                     )}
                     {chatMessages.map((m, i) => (
                       <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                        <div
-                          className="px-4 py-2 text-sm max-w-[85%]"
-                          style={{
-                            backgroundColor: m.role === 'user' ? '#20558A' : '#F4F4F4',
-                            color: m.role === 'user' ? '#fff' : '#333',
-                            borderRadius: '4px',
-                            whiteSpace: 'pre-wrap',
-                          }}
-                        >
-                          {m.content}
-                        </div>
+                        {m.role === 'user' ? (
+                          <div
+                            className="px-4 py-2 text-sm max-w-[85%]"
+                            style={{ backgroundColor: '#20558A', color: '#fff', borderRadius: '8px 8px 2px 8px' }}
+                          >
+                            {m.content}
+                          </div>
+                        ) : (
+                          <div
+                            className="px-4 py-3 text-sm max-w-[90%] prose-chat"
+                            style={{ backgroundColor: '#fff', border: '1px solid #E0E0E0', borderRadius: '2px 8px 8px 8px', color: '#333', lineHeight: '1.6' }}
+                          >
+                            <ReactMarkdown
+                              remarkPlugins={[remarkGfm]}
+                              components={{
+                                table: ({children}) => <div style={{ overflowX: 'auto', marginBottom: '0.75rem' }}><table style={{ borderCollapse: 'collapse', width: '100%', fontSize: '0.85rem' }}>{children}</table></div>,
+                                thead: ({children}) => <thead style={{ backgroundColor: '#E8F0F7' }}>{children}</thead>,
+                                th: ({children}) => <th style={{ border: '1px solid #C5D8EA', padding: '6px 10px', textAlign: 'left', fontWeight: 600, color: '#20558A', whiteSpace: 'nowrap' }}>{children}</th>,
+                                td: ({children}) => <td style={{ border: '1px solid #D3D3D3', padding: '6px 10px', verticalAlign: 'top' }}>{children}</td>,
+                                tr: ({children}) => <tr style={{ borderBottom: '1px solid #E0E0E0' }}>{children}</tr>,
+                                h1: ({children}) => <h1 style={{ fontSize: '1.1rem', fontWeight: 700, marginBottom: '0.5rem', color: '#20558A' }}>{children}</h1>,
+                                h2: ({children}) => <h2 style={{ fontSize: '1rem', fontWeight: 700, marginTop: '1rem', marginBottom: '0.4rem', color: '#20558A', borderBottom: '1px solid #E8F0F7', paddingBottom: '0.2rem' }}>{children}</h2>,
+                                h3: ({children}) => <h3 style={{ fontSize: '0.95rem', fontWeight: 600, marginTop: '0.75rem', marginBottom: '0.3rem', color: '#333' }}>{children}</h3>,
+                                p: ({children}) => <p style={{ marginBottom: '0.6rem' }}>{children}</p>,
+                                ul: ({children}) => <ul style={{ paddingLeft: '1.25rem', marginBottom: '0.6rem', listStyleType: 'disc' }}>{children}</ul>,
+                                ol: ({children}) => <ol style={{ paddingLeft: '1.25rem', marginBottom: '0.6rem', listStyleType: 'decimal' }}>{children}</ol>,
+                                li: ({children}) => <li style={{ marginBottom: '0.25rem' }}>{children}</li>,
+                                strong: ({children}) => <strong style={{ fontWeight: 600, color: '#111' }}>{children}</strong>,
+                                em: ({children}) => <em style={{ color: '#555' }}>{children}</em>,
+                                hr: () => <hr style={{ border: 'none', borderTop: '1px solid #E0E0E0', margin: '0.75rem 0' }} />,
+                                code: ({children}) => <code style={{ backgroundColor: '#F0F4F8', padding: '0.1rem 0.35rem', borderRadius: '3px', fontSize: '0.85em', fontFamily: 'monospace', color: '#1A4470' }}>{children}</code>,
+                                a: ({href, children}) => (
+                                  <a href={href} target="_blank" rel="noopener noreferrer" style={{ color: '#20558A', textDecoration: 'underline', fontWeight: 500 }}>
+                                    {children}
+                                  </a>
+                                ),
+                              }}
+                            >
+                              {addPaperLinks(m.content, chatArticles.length > 0 ? chatArticles : (cachedArticles.length > 0 ? cachedArticles : results))}
+                            </ReactMarkdown>
+                          </div>
+                        )}
                       </div>
                     ))}
                     {isChatLoading && (
@@ -753,7 +837,6 @@ export default function Home() {
                     </button>
                   </div>
                 </div>
-              )}
             </div>
           )}
         </main>
