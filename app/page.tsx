@@ -1,6 +1,8 @@
 'use client';
 
-import { useState, KeyboardEvent } from 'react';
+import { useState, KeyboardEvent, useRef, useEffect } from 'react';
+
+type ChatMessage = { role: 'user' | 'assistant'; content: string };
 
 const ARTICLE_TYPES = [
   'Clinical Trial',
@@ -62,6 +64,19 @@ export default function Home() {
   const [lastQuery, setLastQuery] = useState('');
   const [lastFilters, setLastFilters] = useState<SearchFilters | null>(null);
 
+  // Chat state
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [isChatLoading, setIsChatLoading] = useState(false);
+  const [chatAbstracts, setChatAbstracts] = useState<Record<string, string> | null>(null);
+  const [isLoadingAbstracts, setIsLoadingAbstracts] = useState(false);
+  const chatBottomRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chatMessages, isChatLoading]);
+
   const toggleType = (type: string) =>
     setArticleTypes(prev =>
       prev.includes(type) ? prev.filter(t => t !== type) : [...prev, type]
@@ -72,6 +87,9 @@ export default function Home() {
     setError(null);
     setResults([]);
     setCachedArticles([]);
+    setChatOpen(false);
+    setChatMessages([]);
+    setChatAbstracts(null);
 
     try {
       const res = await fetch('/api/search', {
@@ -186,6 +204,61 @@ export default function Home() {
       alert(`Export failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setIsExporting(false);
+    }
+  };
+
+  const openChat = async () => {
+    setChatOpen(true);
+    if (chatAbstracts) return; // already fetched
+    const articles = cachedArticles.length > 0 ? cachedArticles : results;
+    if (!articles.length) return;
+    setIsLoadingAbstracts(true);
+    try {
+      const res = await fetch('/api/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: lastQuery, translatedQuery: pubmedQuery, filters: lastFilters, page: 0, returnAll: true }),
+      });
+      const data = await res.json();
+      // Fetch abstracts via export endpoint reuse: send to chat directly
+      setChatAbstracts({}); // trigger chat with empty abstracts — server will fetch
+    } catch {
+      setChatAbstracts({});
+    } finally {
+      setIsLoadingAbstracts(false);
+    }
+  };
+
+  const sendChatMessage = async (text?: string) => {
+    const content = (text ?? chatInput).trim();
+    if (!content || isChatLoading) return;
+    const articles = cachedArticles.length > 0 ? cachedArticles : results;
+    if (!articles.length) return;
+
+    const newMessages: ChatMessage[] = [...chatMessages, { role: 'user', content }];
+    setChatMessages(newMessages);
+    setChatInput('');
+    setIsChatLoading(true);
+
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          articles,
+          abstracts: chatAbstracts ?? undefined,
+          messages: newMessages,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      // Cache abstracts returned from server on first call
+      if (data.abstracts) setChatAbstracts(data.abstracts);
+      setChatMessages(prev => [...prev, { role: 'assistant', content: data.reply }]);
+    } catch (e: unknown) {
+      setChatMessages(prev => [...prev, { role: 'assistant', content: `Error: ${e instanceof Error ? e.message : 'Something went wrong'}` }]);
+    } finally {
+      setIsChatLoading(false);
     }
   };
 
@@ -562,6 +635,126 @@ export default function Home() {
             <p className="py-8 text-sm text-center" style={{ color: '#666' }}>
               No results found. Try adjusting your search or relaxing the filters.
             </p>
+          )}
+
+          {/* Chat with Results */}
+          {!isLoading && results.length > 0 && (
+            <div className="mt-6">
+              {!chatOpen ? (
+                <button
+                  onClick={openChat}
+                  className="w-full py-3 text-sm font-medium transition-colors"
+                  style={{
+                    border: '2px solid #20558A',
+                    backgroundColor: '#fff',
+                    color: '#20558A',
+                    cursor: 'pointer',
+                  }}
+                >
+                  💬 Chat with these {(cachedArticles.length || totalResults).toLocaleString()} results
+                </button>
+              ) : (
+                <div style={{ border: '1px solid #D3D3D3' }}>
+                  {/* Chat header */}
+                  <div className="flex items-center justify-between px-4 py-2" style={{ backgroundColor: '#20558A' }}>
+                    <span className="text-sm font-medium text-white">
+                      💬 Chat with {(cachedArticles.length || totalResults).toLocaleString()} papers
+                    </span>
+                    <button
+                      onClick={() => setChatOpen(false)}
+                      className="text-white text-xs opacity-75 hover:opacity-100"
+                    >
+                      ✕ Close
+                    </button>
+                  </div>
+
+                  {/* Suggested questions */}
+                  {chatMessages.length === 0 && (
+                    <div className="p-4" style={{ backgroundColor: '#F9F9F9', borderBottom: '1px solid #E0E0E0' }}>
+                      <p className="text-xs mb-2" style={{ color: '#666' }}>Suggested questions:</p>
+                      <div className="flex flex-wrap gap-2">
+                        {[
+                          'What are the main findings across these papers?',
+                          'What are the limitations of this evidence?',
+                          'Which papers have the strongest study design?',
+                          'Are there any contradictions in the findings?',
+                          'Summarize the clinical implications',
+                        ].map(q => (
+                          <button
+                            key={q}
+                            onClick={() => sendChatMessage(q)}
+                            className="px-3 py-1 text-xs transition-colors"
+                            style={{
+                              border: '1px solid #AAC2D8',
+                              backgroundColor: '#fff',
+                              color: '#20558A',
+                              cursor: 'pointer',
+                            }}
+                          >
+                            {q}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Messages */}
+                  <div className="p-4 space-y-4 overflow-y-auto" style={{ maxHeight: '500px', minHeight: '100px' }}>
+                    {isLoadingAbstracts && (
+                      <p className="text-sm text-center" style={{ color: '#666' }}>Loading paper abstracts…</p>
+                    )}
+                    {chatMessages.map((m, i) => (
+                      <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                        <div
+                          className="px-4 py-2 text-sm max-w-[85%]"
+                          style={{
+                            backgroundColor: m.role === 'user' ? '#20558A' : '#F4F4F4',
+                            color: m.role === 'user' ? '#fff' : '#333',
+                            borderRadius: '4px',
+                            whiteSpace: 'pre-wrap',
+                          }}
+                        >
+                          {m.content}
+                        </div>
+                      </div>
+                    ))}
+                    {isChatLoading && (
+                      <div className="flex justify-start">
+                        <div className="px-4 py-2 text-sm" style={{ backgroundColor: '#F4F4F4', borderRadius: '4px', color: '#666' }}>
+                          Thinking…
+                        </div>
+                      </div>
+                    )}
+                    <div ref={chatBottomRef} />
+                  </div>
+
+                  {/* Input */}
+                  <div className="flex gap-2 p-3" style={{ borderTop: '1px solid #E0E0E0' }}>
+                    <input
+                      type="text"
+                      value={chatInput}
+                      onChange={e => setChatInput(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter') sendChatMessage(); }}
+                      placeholder="Ask a question about these papers…"
+                      className="flex-1 px-3 py-2 text-sm outline-none"
+                      style={{ border: '1px solid #D3D3D3' }}
+                      disabled={isChatLoading}
+                    />
+                    <button
+                      onClick={() => sendChatMessage()}
+                      disabled={isChatLoading || !chatInput.trim()}
+                      className="px-4 py-2 text-sm text-white transition-colors"
+                      style={{
+                        backgroundColor: isChatLoading || !chatInput.trim() ? '#AAC2D8' : '#20558A',
+                        cursor: isChatLoading || !chatInput.trim() ? 'not-allowed' : 'pointer',
+                      }}
+                    >
+                      Send
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
           )}
         </main>
       </div>
